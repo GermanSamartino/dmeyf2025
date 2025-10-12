@@ -1,0 +1,1259 @@
+---
+title: "TP1-Entrega"
+author: "Germán Samartino Salerno"
+date: "02/10/2025"
+output:
+   html_document:
+     toc: yes
+     code_folding: show
+     toc_float: yes
+     df_print: paged
+     theme: united
+     code_download: true
+---
+# START
+```{r librerias, include=FALSE}
+# limpio la memoria
+rm(list=ls(all.names=TRUE)) # remove all objects
+gc(full=TRUE, verbose=FALSE) # garbage collection
+
+
+# cargo las librerias que necesito
+require("data.table")
+require("parallel")
+
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+if( !require("primes") ) install.packages("primes")
+require("primes")
+
+if( !require("utils") ) install.packages("utils")
+require("utils")
+
+if( !require("rlist") ) install.packages("rlist")
+require("rlist")
+
+if( !require("yaml")) install.packages("yaml")
+require("yaml")
+
+if( !require("lightgbm") ) install.packages("lightgbm")
+require("lightgbm")
+
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+```
+
+
+```{r read_data}
+# leo el dataset
+dataset <- fread("competencia_01_crudo.csv" )
+```
+
+
+
+```{r clase_ternaria}
+# calculo el periodo0 consecutivo
+dsimple <- dataset[, list(
+    "pos" = .I,
+    numero_de_cliente,
+    periodo0 = as.integer(foto_mes/100)*12 +  foto_mes%%100 ) ]
+
+
+# ordeno
+setorder( dsimple, numero_de_cliente, periodo0 )
+
+# calculo topes
+periodo_ultimo <- dsimple[, max(periodo0) ]
+periodo_anteultimo <- periodo_ultimo - 1
+
+
+# calculo los leads de orden 1 y 2
+dsimple[, c("periodo1", "periodo2") :=
+    shift(periodo0, n=1:2, fill=NA, type="lead"),  numero_de_cliente ]
+
+# assign most common class values = "CONTINUA"
+dsimple[ periodo0 < periodo_anteultimo, clase_ternaria := "CONTINUA" ]
+
+# calculo BAJA+1
+dsimple[ periodo0 < periodo_ultimo &
+    ( is.na(periodo1) | periodo0 + 1 < periodo1 ),
+    clase_ternaria := "BAJA+1" ]
+
+# calculo BAJA+2
+dsimple[ periodo0 < periodo_anteultimo & (periodo0+1 == periodo1 )
+    & ( is.na(periodo2) | periodo0 + 2 < periodo2 ),
+    clase_ternaria := "BAJA+2" ]
+
+
+# pego el resultado en el dataset original y grabo
+setorder( dsimple, pos )
+dataset[, clase_ternaria := dsimple$clase_ternaria ]
+
+# fwrite( dataset,
+#     file =  "competencia_01.csv.gz",
+#     sep = ","
+# )
+```
+
+
+# TRANSFORMACIONES
+
+
+```{r paso_Master_al_final}
+# 1. Identificar las columnas que comienzan con "Master_"
+columnas_a_renombrar <- grep("^Master_", names(dataset), value = TRUE)
+
+# 2. Crear los nuevos nombres de columna
+# La expresión regular busca 'Master_' al inicio, captura el resto (.*), 
+# y luego reestructura el nombre poniendo lo capturado seguido de '_Master'
+nuevos_nombres <- gsub("^(Master_)(.*)$", "\\2_Master", columnas_a_renombrar)
+
+# 3. Aplicar el renombramiento
+setnames(dataset, columnas_a_renombrar, nuevos_nombres)
+
+cat("Se han renombrado las siguientes columnas:\n")
+print(data.table(Original = columnas_a_renombrar, Nuevo = nuevos_nombres))
+```
+
+
+
+```{r moneda_constante}
+# Tabla de factores de ajuste de inflación
+# La base de ajuste es 202106 (factor = 1.00)
+# Los meses anteriores tienen factores mayores a 1.00
+
+dt_ajuste <- data.table(
+  foto_mes = 202101:202106,
+  factor_ajuste = c(
+    1.00,  # Factor para 202101 (Base)
+    1.0778,  # Factor para 202102
+    1.1295,  # Factor para 202103
+    1.1756,  # Factor para 202104
+    1.2147,  # Factor para 202105
+    1.2532   # Factor para 202106 
+  )
+)
+
+# 1. Identificar las columnas que comienzan con "m"
+columnas_monto <- grep("^m", names(dataset), value = TRUE)
+
+# 2. Unir el dataset con la tabla de ajuste
+# Esto añade la columna 'factor_ajuste' al dataset
+setkey(dt_ajuste, foto_mes)
+setkey(dataset, foto_mes)
+
+dataset_ajustado <- dt_ajuste[dataset, nomatch = 0] # Realiza el join
+
+# 3. Aplicar la corrección por inflación a todas las columnas "m"
+
+# La función se aplica a todas las columnas en .SDcols
+# El factor_ajuste está disponible porque se unió en el paso anterior
+dataset_ajustado[, 
+  (columnas_monto) := lapply(.SD, function(x) x / factor_ajuste), 
+  .SDcols = columnas_monto]
+
+# 4. Eliminar la columna de factor_ajuste si ya no se necesita
+dataset_ajustado[, factor_ajuste := NULL]
+
+# Opcional: Reemplaza tu dataset original con la versión ajustada
+dataset <- dataset_ajustado
+```
+
+
+
+
+```{r aguinaldo}
+# Asegúrate de que tu dataset esté ordenado por cliente y tiempo antes del bucle
+setorder(dataset, numero_de_cliente, foto_mes) 
+# (Asumiendo que esta línea ya se ejecutó previamente)
+
+# ---
+# Definir Parámetros
+# ---
+
+MES_AGUINALDO <- 202106
+UMBRAL_MIN_AUMENTO <- 1.40 # 40% de aumento
+UMBRAL_MAX_AUMENTO <- 1.60 # 60% de aumento
+FACTOR_REDUCCION <- 0.66  # Reducir el valor del mes de junio al 66%
+
+# Columnas a corregir
+columnas_a_corregir <- c("mpayroll", "mpayroll2")
+
+
+# ---
+# Aplicar la Corrección (Clipping)
+# ---
+
+# Bucle para iterar sobre ambas columnas (mpayroll y mpayroll2)
+for (col_original in columnas_a_corregir) {
+  
+  col_lag <- paste0(col_original, "_lag_temp") # Nombre temporal para la columna lag
+  
+  cat("--- Procesando columna:", col_original, "---\n")
+  
+  # 1. CREAR la columna lag temporal con shift()
+  dataset[, (col_lag) := shift(get(col_original), n = 1, fill = NA, type = "lag"), 
+          by = numero_de_cliente]
+  
+  cat("Columna temporal", col_lag, "creada.\n")
+  
+  # 2. Aplicar la corrección (Clipping)
+  dataset[
+    # 1. Filtro por el mes objetivo (202106)
+    foto_mes == MES_AGUINALDO &
+    
+    # 2. El valor del mes anterior NO debe ser cero y no debe ser NA
+    get(col_lag) > 0 & !is.na(get(col_lag)) &
+    
+    # 3. Detectar el aumento (Ratio entre 1.40 y 1.60)
+    get(col_original) / get(col_lag) >= UMBRAL_MIN_AUMENTO &
+    get(col_original) / get(col_lag) <= UMBRAL_MAX_AUMENTO,
+    
+    # 4. Acción: Reducir el valor de la columna original al 66%
+    (col_original) := get(col_original) * FACTOR_REDUCCION
+  ]
+  
+  cat("Corrección aplicada a la columna", col_original, "\n")
+  
+  # 3. ELIMINAR la columna lag temporal
+  dataset[, (col_lag) := NULL]
+  
+  cat("Columna temporal", col_lag, "eliminada.\n\n")
+}
+
+# La columna original 'mpayroll' y 'mpayroll2' en el mes 202106 han sido corregidas.
+
+```
+
+
+
+
+```{r grafico_payroll}
+
+
+# 1. Definir los parámetros de tiempo y columnas
+MESES_FILTRO <- 202101:202106
+COLUMNAS_INTERES <- c("mpayroll", "mpayroll2")
+
+# 2. Preparar los datos
+plot_data <- dataset %>%
+  filter(foto_mes %in% MESES_FILTRO) %>%
+  select(foto_mes, all_of(COLUMNAS_INTERES)) %>%
+  group_by(foto_mes) %>%
+  summarise(
+    mpayroll = mean(mpayroll, na.rm = TRUE),
+    mpayroll2 = mean(mpayroll2, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  pivot_longer(
+    cols = all_of(COLUMNAS_INTERES),
+    names_to = "Variable",
+    values_to = "Media"
+  )
+
+# 3. Generar el gráfico de líneas con etiquetas
+p <- ggplot(plot_data, aes(x = as.factor(foto_mes), y = Media, group = Variable, color = Variable)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  
+  # === CAPA AÑADIDA: geom_text() ===
+  geom_text(
+    aes(label = round(Media, 0)), # Especifica la columna Media, redondeada sin decimales
+    vjust = -0,                # Mueve la etiqueta ligeramente por encima del punto
+    size = 4,                    # Tamaño de la fuente
+    show.legend = FALSE          # No mostrar esta capa en la leyenda
+  ) +
+  # ===
+  
+  # Configurar etiquetas y títulos
+  labs(
+    title = "Evolución Mensual de Pagos de Salarios (202101 - 202106)",
+    x = "Mes",
+    y = "Media del Salario Percibido",
+    color = "Columna"
+  ) +
+  
+  # Personalizar la estética
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# Mostrar el gráfico
+print(p)
+
+```
+
+
+
+
+```{r lag_1_sin_aguinaldo}
+
+# leo el dataset
+#dataset <- fread("competencia_01_gz.csv" )
+
+# -- LAGS ---
+
+# --- 1. Definir las columnas a procesar ---
+
+# Excluir las columnas que no deben ser modificadas
+columnas_excluidas <- c("numero_de_cliente", "foto_mes", "clase_ternaria")
+
+# Obtener los nombres de las columnas que SÍ se deben procesar
+columnas_a_procesar <- setdiff(names(dataset), columnas_excluidas)
+
+
+# --- 2. Aplicar la transformación (Lag y Delta) ---
+
+# 2.1. Ordenar el dataset por cliente y tiempo (esencial para shift())
+setorder(dataset, numero_de_cliente, foto_mes)
+
+
+# 2.2. Aplicar shift() (lag) y la diferencia (delta) a todas las columnas
+dataset[, (paste0(columnas_a_procesar, "_lag_1")) :=
+          lapply(.SD, shift, n = 1, fill = NA, type = "lag"),
+        by = numero_de_cliente,
+        .SDcols = columnas_a_procesar]
+
+
+dataset[, (paste0(columnas_a_procesar, "_delta_lag_1")) :=
+          lapply(columnas_a_procesar, function(x) get(x) - get(paste0(x, "_lag_1")))]
+
+```
+
+
+# PARAMETROS
+
+
+```{r meses_exp_}
+PARAM <- list()
+PARAM$experimento <- 2012
+PARAM$semilla_primigenia <- 254881
+
+# training y future
+PARAM$train <- c(202101)#, 202102, 202103)
+PARAM$train_final <- c(202101, 202102, 202103, 202104)
+PARAM$future <- c(202106)
+PARAM$future_env <- c(202104)
+PARAM$semilla_kaggle <- 314159
+PARAM$cortes <- seq(6000, 19000, by= 500)
+
+# un undersampling de 0.1  toma solo el 10% de los CONTINUA
+# undersampling de 1.0  implica tomar TODOS los datos
+
+PARAM$trainingstrategy$undersampling <- 0.2
+
+# Parametros LightGBM
+
+PARAM$hyperparametertuning$xval_folds <- 5
+
+# parametros fijos del LightGBM que se pisaran con la parte variable de la BO
+PARAM$lgbm$param_fijos <-  list(
+  boosting= "gbdt", # puede ir  dart  , ni pruebe random_forest
+  objective= "binary",
+  metric= "auc",
+  first_metric_only= FALSE,
+  boost_from_average= TRUE,
+  feature_pre_filter= FALSE,
+  force_row_wise= TRUE, # para reducir warnings
+  verbosity= -100,
+
+  seed= PARAM$semilla_primigenia,
+
+  max_depth= -1L, # -1 significa no limitar,  por ahora lo dejo fijo
+  min_gain_to_split= 0, # min_gain_to_split >= 0
+  min_sum_hessian_in_leaf= 0.001, #  min_sum_hessian_in_leaf >= 0.0
+  lambda_l1= 0.0, # lambda_l1 >= 0.0
+  lambda_l2= 0.0, # lambda_l2 >= 0.0
+  max_bin= 31L, # lo debo dejar fijo, no participa de la BO
+
+  bagging_fraction= 1.0, # 0.0 < bagging_fraction <= 1.0
+  pos_bagging_fraction= 1.0, # 0.0 < pos_bagging_fraction <= 1.0
+  neg_bagging_fraction= 1.0, # 0.0 < neg_bagging_fraction <= 1.0
+  is_unbalance= FALSE, #
+  scale_pos_weight= 1.0, # scale_pos_weight > 0.0
+
+  drop_rate= 0.1, # 0.0 < neg_bagging_fraction <= 1.0
+  max_drop= 50, # <=0 means no limit
+  skip_drop= 0.5, # 0.0 <= skip_drop <= 1.0
+
+  extra_trees= FALSE,
+
+  num_iterations= 1200,
+  learning_rate= 0.02,
+  feature_fraction= 0.5,
+  num_leaves= 750,
+  min_data_in_leaf= 5000
+)
+
+
+
+```
+
+#BAYESIANA
+
+
+```{r hiper_limites}
+# Hiperparámetros de LightGBM que participan de la Bayesian Optimization
+#si es un numero entero debe ir  makeIntegerParam
+#si es un numero real (con decimales) debe ir  makeNumericParam
+#es muy importante leer cuales son un lower y upper  permitidos y ademas razonables
+
+#Aqui se definen los hiperparámetros de LightGBM que participan de la Bayesian Optimization
+
+# Aqui se cargan los bordes de los hiperparametros de la BO
+PARAM$hypeparametertuning$hs <- makeParamSet(
+  makeIntegerParam("num_iterations", lower= 8L, upper= 2048L),
+  makeNumericParam("learning_rate", lower= 0.01, upper= 0.3),
+  makeNumericParam("feature_fraction", lower= 0.1, upper= 1.0),
+  makeIntegerParam("num_leaves", lower= 8L, upper= 2048L),
+  makeIntegerParam("min_data_in_leaf", lower= 1L, upper= 8000L)
+)
+
+#A mayor cantidad de hiperparámetros, se debe aumentar las iteraciones de la Bayesian Optimization
+#30 es un valor muy tacaño, pero corre rápido
+#deberia partir de 50, alcanzando los 100 si se dispone de tiempo
+PARAM$hyperparametertuning$iteraciones <- 30 # iteraciones bayesianas
+
+# particionar agrega una columna llamada fold a un dataset
+#   que consiste en una particion estratificada segun agrupa
+# particionar( data=dataset, division=c(70,30),
+#  agrupa=clase_ternaria, seed=semilla)   crea una particion 70, 30
+
+
+```
+
+# Funciones
+
+```{r funciones}
+
+particionar <- function(data, division, agrupa= "", campo= "fold", start= 1, seed= NA) {
+  if (!is.na(seed)) set.seed(seed, "L'Ecuyer-CMRG")
+
+  bloque <- unlist(mapply(
+    function(x, y) {rep(y, x)},division, seq(from= start, length.out= length(division))))
+
+  data[, (campo) := sample(rep(bloque,ceiling(.N / length(bloque))))[1:.N],by= agrupa]
+}
+
+# iniciliazo el dataset de realidad, para medir ganancia
+realidad_inicializar <- function( pfuture, pparam) {
+
+  # datos para verificar la ganancia
+  drealidad <- pfuture[, list(numero_de_cliente, foto_mes, clase_ternaria)]
+
+  particionar(drealidad,
+    division= c(3, 7),
+    agrupa= "clase_ternaria",
+    seed= PARAM$semilla_kaggle
+  )
+
+  return( drealidad )
+}
+
+# evaluo ganancia en los datos de la realidad
+
+realidad_evaluar <- function( prealidad, pprediccion) {
+
+  prealidad[ pprediccion,
+    on= c("numero_de_cliente", "foto_mes"),
+    predicted:= i.Predicted
+  ]
+
+  tbl <- prealidad[, list("qty"=.N), list(fold, predicted, clase_ternaria)]
+
+  res <- list()
+  res$public  <- tbl[fold==1 & predicted==1L, sum(qty*ifelse(clase_ternaria=="BAJA+2", 780000, -20000))]/0.3
+  res$private <- tbl[fold==2 & predicted==1L, sum(qty*ifelse(clase_ternaria=="BAJA+2", 780000, -20000))]/0.7
+  res$total <- tbl[predicted==1L, sum(qty*ifelse(clase_ternaria=="BAJA+2", 780000, -20000))]
+
+  prealidad[, predicted:=NULL]
+  return( res )
+}
+```
+
+# Preprocesamiento
+
+```{r preproces}
+dataset_train <- dataset[foto_mes %in% PARAM$train]
+
+# paso la clase a binaria que tome valores {0,1}  enteros
+#  BAJA+1 y BAJA+2  son  1,   CONTINUA es 0
+#  a partir de ahora ya NO puedo cortar  por prob(BAJA+2) > 1/40
+
+dataset_train[,
+  clase01 := ifelse(clase_ternaria %in% c("BAJA+2","BAJA+1"), 1L, 0L)
+]
+
+# defino los datos que forma parte del training
+# aqui se hace el undersampling de los CONTINUA
+# notar que para esto utilizo la SEGUNDA semilla
+
+set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")
+dataset_train[, azar := runif(nrow(dataset_train))]
+dataset_train[, training := 0L]
+
+dataset_train[
+  foto_mes %in%  PARAM$train &
+    (azar <= PARAM$trainingstrategy$undersampling | clase_ternaria %in% c("BAJA+1", "BAJA+2")),
+  training := 1L
+]
+
+# los campos que se van a utilizar
+
+campos_buenos <- setdiff(
+  colnames(dataset_train),
+  c("clase_ternaria", "clase01", "azar", "training")
+)
+
+# dejo los datos en el formato que necesita LightGBM
+
+dtrain <- lgb.Dataset(
+  data= data.matrix(dataset_train[training == 1L, campos_buenos, with= FALSE]),
+  label= dataset_train[training == 1L, clase01],
+  free_raw_data= FALSE
+)
+
+nrow(dtrain)
+ncol(dtrain)
+
+
+```
+
+# Configuración Bayesiana
+
+```{r estimar_ganan_ctrl}
+# En el argumento x llegan los parmaetros de la bayesiana
+#  devuelve la AUC en cross validation del modelo entrenado
+
+EstimarGanancia_AUC_lightgbm <- function(x) {
+
+  # x pisa (o agrega) a param_fijos
+  param_completo <- PARAM$lgbm$param_fijos
+
+  # entreno LightGBM
+  modelocv <- lgb.cv(
+    data= dtrain,
+    nfold= PARAM$hyperparametertuning$xval_folds,
+    stratified= TRUE,
+    param= param_completo
+  )
+
+  # obtengo la ganancia
+  AUC <- modelocv$best_score
+
+  # hago espacio en la memoria
+  rm(modelocv)
+  gc(full= TRUE, verbose= FALSE)
+
+  message(format(Sys.time(), "%a %b %d %X %Y"), " AUC ", AUC)
+
+  return(AUC)
+}
+
+# Aqui comienza la configuracion de la Bayesian Optimization
+
+# en este archivo quedan la evolucion binaria de la BO
+kbayesiana <- "bayesiana.RDATA"
+
+funcion_optimizar <- EstimarGanancia_AUC_lightgbm # la funcion que voy a maximizar
+
+configureMlr(show.learner.output= FALSE)
+
+# configuro la busqueda bayesiana,  los hiperparametros que se van a optimizar
+# por favor, no desesperarse por lo complejo
+
+obj.fun <- makeSingleObjectiveFunction(
+  fn= funcion_optimizar, # la funcion que voy a maximizar
+  minimize= FALSE, # estoy Maximizando la ganancia
+  noisy= TRUE,
+  par.set= PARAM$hypeparametertuning$hs, # definido al comienzo del programa
+  has.simple.signature= FALSE # paso los parametros en una lista
+)
+
+# cada 600 segundos guardo el resultado intermedio
+ctrl <- makeMBOControl(
+  save.on.disk.at.time= 600, # se graba cada 600 segundos
+  save.file.path= kbayesiana
+) # se graba cada 600 segundos
+
+# indico la cantidad de iteraciones que va a tener la Bayesian Optimization
+ctrl <- setMBOControlTermination(
+  ctrl,
+  iters= PARAM$hyperparametertuning$iteraciones
+) # cantidad de iteraciones
+
+# defino el método estandar para la creacion de los puntos iniciales,
+# los "No Inteligentes"
+ctrl <- setMBOControlInfill(ctrl, crit= makeMBOInfillCritEI())
+
+# establezco la funcion que busca el maximo
+surr.km <- makeLearner(
+  "regr.km",
+  predict.type= "se",
+  covtype= "matern3_2",
+  control= list(trace= TRUE)
+)
+```
+
+
+
+```{r iniciar_bayes, eval=FALSE}
+# inicio la optimizacion bayesiana, retomando si ya existe
+# es la celda mas lenta de todo el notebook
+
+if (!file.exists(kbayesiana)) {
+  bayesiana_salida <- mbo(obj.fun, learner= surr.km, control= ctrl)
+} else {
+  bayesiana_salida <- mboContinue(kbayesiana) # retomo en caso que ya exista
+}
+
+
+tb_bayesiana <- as.data.table(bayesiana_salida$opt.path)
+colnames( tb_bayesiana)
+
+# almaceno los resultados de la Bayesian Optimization
+# y capturo los mejores hiperparametros encontrados
+
+tb_bayesiana <- as.data.table(bayesiana_salida$opt.path)
+
+tb_bayesiana[, iter := .I]
+
+# ordeno en forma descendente por AUC = y
+setorder(tb_bayesiana, -y)
+
+# grabo para eventualmente poder utilizarlos en OTRA corrida
+fwrite( tb_bayesiana,
+  file= "BO_log.txt",
+  sep= "\t"
+)
+
+# los mejores hiperparámetros son los que quedaron en el registro 1 de la tabla
+PARAM$out$lgbm$mejores_hiperparametros <- tb_bayesiana[
+  1, # el primero es el de mejor AUC
+  setdiff(colnames(tb_bayesiana),
+    c("y","dob","eol","error.message","exec.time","ei","error.model",
+      "train.time","prop.type","propose.time","se","mean","iter")),
+  with= FALSE
+]
+
+
+PARAM$out$lgbm$y <- tb_bayesiana[1, y]
+
+write_yaml( PARAM, file="PARAM.yml")
+
+print(PARAM$out$lgbm$mejores_hiperparametros)
+print(PARAM$out$lgbm$y)
+```
+
+
+# Final Training Modelo 1
+
+
+```{r train_final_param}
+#setwd("/content/buckets/b1/exp")
+experimento <- paste0("exp", PARAM$experimento)
+dir.create(experimento, showWarnings= FALSE)
+#setwd( paste0("/exp/", experimento ))
+
+#### Final Training Dataset
+#
+# Aqui esta la gran decision de en qué meses hago el Final Training
+# debo utilizar los mejores hiperparámetros que encontré en la  optimización bayesiana
+
+# clase01
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+dataset_train <- dataset[foto_mes %in% PARAM$train_final]
+dataset_train[,.N,clase_ternaria]
+
+# dejo los datos en el formato que necesita LightGBM
+
+dtrain_final <- lgb.Dataset(
+  data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+  label= dataset_train[, clase01]
+)
+
+#---- Entreno con los Mejores HIPERPARAMETROS
+
+param_final <- PARAM$lgbm$param_fijos
+
+param_final
+
+
+# este punto es muy SUTIL  y será revisado en la Clase 05
+
+param_normalizado <- copy(param_final)
+param_normalizado$min_data_in_leaf <-  round(param_final$min_data_in_leaf / PARAM$trainingstrategy$undersampling)
+
+```
+
+
+
+# SEMILLAS Modelo 1
+
+
+
+```{r pred_por_semillas}
+
+# 1. Definir la lista de semillas (5 números cualesquiera)
+semillas_prim <- c(100057, 100207, 100237, 100267, 100297)
+
+# 2. Inicializar una lista para guardar todos los modelos (opcional, pero recomendado)
+modelos_finales <- list()
+
+# 3. Iterar sobre las semillas
+for (i in seq_along(semillas_prim)) {
+  
+  # a. Obtener la semilla actual
+  semilla_actual <- semillas_prim[i]
+  
+  # b. Insertar la semilla actual en los parámetros (ASUMIENDO QUE EXISTE LA CLAVE 'seed')
+  param_normalizado$seed <- semilla_actual
+  
+  # c. Entrenar LightGBM
+  cat("Iniciando entrenamiento con semilla:", semilla_actual, "\n")
+  
+  # Training
+# Genero el modelo final, siempre sobre TODOS los datos de  final_train, sin hacer ningun tipo de undersampling de la clase mayoritaria y mucho menos cross validation.
+  
+  modelo_final <- lgb.train(
+    data = dtrain_final,
+    param = param_normalizado
+  )
+  
+  # d. Guardar el modelo en la lista de resultados
+  # Se le da un nombre basado en el índice o la semilla para fácil identificación
+  modelos_finales[[paste0("modelo_", semilla_actual)]] <- modelo_final
+
+
+  # ahora imprimo la importancia de variables
+
+  tb_importancia <- as.data.table(lgb.importance(modelo_final))
+  #archivo_importancia <- "impo.txt"
+  # b. Generar el nombre del archivo dinámicamente
+  archivo_importancia <- paste0("impo_", semilla_actual, ".txt")
+
+  fwrite(tb_importancia,
+    file= archivo_importancia,
+    sep= "\t"
+  )
+  # grabo a disco el modelo en un formato para seres humanos ... ponele ...
+  lgb.save(modelo_final, "modelo.txt" )
+
+  # aplico el modelo a los datos sin clase
+  dfuture <- dataset[foto_mes %in% PARAM$future]
+
+  # aplico el modelo a los datos nuevos
+  prediccion <- predict(
+    modelo_final,
+    data.matrix(dfuture[, campos_buenos, with= FALSE])
+  )
+
+  # inicilizo el dataset  drealidad
+  drealidad <- realidad_inicializar( dfuture, PARAM)
+
+  # tabla de prediccion
+
+  tb_prediccion <- dfuture[, list(numero_de_cliente, foto_mes)]
+  tb_prediccion[, prob := prediccion ]
+
+  # grabo las probabilidad del modelo
+  fwrite(tb_prediccion,
+    file=  paste0("prediccion_", semilla_actual, ".txt"),
+    sep= "\t"
+  )
+}
+```
+
+# Final Training Modelo 2
+
+
+```{r train_final_param}
+#setwd("/content/buckets/b1/exp")
+experimento <- paste0("exp", PARAM$experimento)
+dir.create(experimento, showWarnings= FALSE)
+
+PARAM$train_final <- c(202101)
+
+#setwd( paste0("/exp/", experimento ))
+
+#### Final Training Dataset
+#
+# Aqui esta la gran decision de en qué meses hago el Final Training
+# debo utilizar los mejores hiperparámetros que encontré en la  optimización bayesiana
+
+# clase01
+dataset[, clase01 := ifelse(clase_ternaria %in% c("BAJA+1", "BAJA+2"), 1L, 0L)]
+
+dataset_train <- dataset[foto_mes %in% PARAM$train_final]
+dataset_train[,.N,clase_ternaria]
+
+# dejo los datos en el formato que necesita LightGBM
+
+dtrain_final <- lgb.Dataset(
+  data= data.matrix(dataset_train[, campos_buenos, with= FALSE]),
+  label= dataset_train[, clase01]
+)
+
+#---- Entreno con los Mejores HIPERPARAMETROS
+
+param_final <- PARAM$lgbm$param_fijos
+
+param_final
+
+
+# este punto es muy SUTIL  y será revisado en la Clase 05
+
+param_normalizado <- copy(param_final)
+param_normalizado$min_data_in_leaf <-  round(param_final$min_data_in_leaf / PARAM$trainingstrategy$undersampling)
+
+```
+
+
+
+# SEMILLAS Modelo 2
+
+
+
+```{r pred_por_semillas}
+
+# 1. Definir la lista de semillas (5 números cualesquiera)
+semillas_prim <- c(378553, 900007, 749987, 499987, 254881)
+
+# 2. Inicializar una lista para guardar todos los modelos (opcional, pero recomendado)
+modelos_finales <- list()
+
+# 3. Iterar sobre las semillas
+for (i in seq_along(semillas_prim)) {
+  
+  # a. Obtener la semilla actual
+  semilla_actual <- semillas_prim[i]
+  
+  # b. Insertar la semilla actual en los parámetros (ASUMIENDO QUE EXISTE LA CLAVE 'seed')
+  param_normalizado$seed <- semilla_actual
+  
+  # c. Entrenar LightGBM
+  cat("Iniciando entrenamiento con semilla:", semilla_actual, "\n")
+  
+  # Training
+# Genero el modelo final, siempre sobre TODOS los datos de  final_train, sin hacer ningun tipo de undersampling de la clase mayoritaria y mucho menos cross validation.
+  
+  modelo_final <- lgb.train(
+    data = dtrain_final,
+    param = param_normalizado
+  )
+  
+  # d. Guardar el modelo en la lista de resultados
+  # Se le da un nombre basado en el índice o la semilla para fácil identificación
+  modelos_finales[[paste0("modelo_", semilla_actual)]] <- modelo_final
+
+
+  # ahora imprimo la importancia de variables
+
+  tb_importancia <- as.data.table(lgb.importance(modelo_final))
+  #archivo_importancia <- "impo.txt"
+  # b. Generar el nombre del archivo dinámicamente
+  archivo_importancia <- paste0("impo_", semilla_actual, ".txt")
+
+  fwrite(tb_importancia,
+    file= archivo_importancia,
+    sep= "\t"
+  )
+  # grabo a disco el modelo en un formato para seres humanos ... ponele ...
+  lgb.save(modelo_final, "modelo.txt" )
+
+  # aplico el modelo a los datos sin clase
+  dfuture <- dataset[foto_mes %in% PARAM$future]
+
+  # aplico el modelo a los datos nuevos
+  prediccion <- predict(
+    modelo_final,
+    data.matrix(dfuture[, campos_buenos, with= FALSE])
+  )
+
+  # inicilizo el dataset  drealidad
+  drealidad <- realidad_inicializar( dfuture, PARAM)
+
+  # tabla de prediccion
+
+  tb_prediccion <- dfuture[, list(numero_de_cliente, foto_mes)]
+  tb_prediccion[, prob := prediccion ]
+
+  # grabo las probabilidad del modelo
+  fwrite(tb_prediccion,
+    file=  paste0("prediccion_", semilla_actual, ".txt"),
+    sep= "\t"
+  )
+}
+```
+
+# ENVIOS
+
+```{r envio, eval=FALSE}
+# 
+# # 1. Definir la lista de semillas (5 números cualesquiera)
+semillas_prim <- c(378553, 900007, 749987, 499987, 254881)
+# 
+# # 2. Inicializar una lista para guardar todos los modelos (opcional, pero recomendado)
+# modelos_finales <- list()
+# 
+# # 3. Iterar sobre las semillas
+for (i in seq_along(semillas_prim)) {
+# genero archivos con los  "envios" mejores
+
+
+semilla_actual <- semillas_prim[i]
+  
+# ordeno por probabilidad descendente
+setorder(tb_prediccion, -prob)
+
+dir.create("kaggle")
+
+# b. Insertar la semilla actual en los parámetros (ASUMIENDO QUE EXISTE LA CLAVE 'seed')
+  param_normalizado$seed <- semilla_actual
+
+# aplico el modelo a los datos sin clase
+dfuture_env <- dataset[foto_mes %in% PARAM$future_env]
+
+# aplico el modelo a los datos nuevos
+prediccion <- predict(
+  modelo_final,
+  data.matrix(dfuture_env[, campos_buenos, with= FALSE])
+)
+
+# inicilizo el dataset  drealidad
+drealidad_env <- realidad_inicializar( dfuture_env, param_normalizado)
+
+# tabla de prediccion
+
+tb_prediccion_env <- dfuture_env[, list(numero_de_cliente, foto_mes)]
+tb_prediccion_env[, prob := prediccion ]
+
+# ordeno por probabilidad descendente
+setorder(tb_prediccion_env, -prob)
+
+for (envios in PARAM$cortes) {
+
+  tb_prediccion_env[, Predicted := 0L] # seteo inicial a 0
+  tb_prediccion_env[1:envios, Predicted := 1L] # marco los primeros
+
+  archivo_kaggle <- paste0("./kaggle/KA", PARAM$experimento, "_", semilla_actual, "_", envios, ".csv")
+
+  # grabo el archivo
+  fwrite(tb_prediccion_env[, list(numero_de_cliente, Predicted)],
+    file= archivo_kaggle,
+    sep= ","
+  )
+
+  res <- realidad_evaluar( drealidad_env, tb_prediccion_env)
+
+  options(scipen = 999)
+  cat( "Envios=", envios, "\t",
+    " TOTAL=", res$total,
+    "  Public=", res$public,
+    " Private=", res$private,
+    "\n",
+    sep= ""
+  )
+
+}
+}
+write_yaml( PARAM, file="PARAM.yml")
+
+cat("Entrenamiento completado para semilla:", semilla_actual, "\n")
+
+
+# La variable 'modelos_finales' ahora contiene los 5 modelos entrenados.
+```
+
+# ENSAMBLE
+
+
+```{r semillas_ensamble}
+#library(data.table)
+
+# 1. Definir los Archivos de Entrada
+# ===
+
+# Reemplaza los nombres de archivo con los que generaste anteriormente (impo_101.txt, etc.)
+# O usa la estructura de semillas si los archivos siguen ese patrón.
+semillas <- c(378553, 900007, 749987, 499987, 254881, 100057, 100207, 100237, 100267, 100297) 
+archivos_a_leer <- paste0("prediccion_", semillas, ".txt")
+
+# Si los nombres son completamente diferentes, usa esta lista:
+# archivos_a_leer <- c("prediccion_semilla_1.txt", "prediccion_semilla_2.txt", "prediccion_semilla_3.txt", "prediccion_semilla_4.txt", "prediccion_semilla_5.txt")
+
+
+
+# 2. Leer, Combinar y Promediar las Predicciones
+# ===
+
+# Inicializa una lista vacía para almacenar los data.tables
+lista_predicciones <- list()
+
+# Bucle para leer cada archivo y almacenarlo en la lista
+for (archivo in archivos_a_leer) {
+  
+  # Usamos fread para leer eficientemente solo las columnas necesarias
+  # Asegúrate de que los archivos TXT usan coma (",") como separador.
+  dt_temp <- fread(archivo, select = c("numero_de_cliente", "prob"))
+  lista_predicciones[[archivo]] <- dt_temp
+  
+  cat("Archivo leído:", archivo, "\n")
+}
+
+# Combina todos los data.tables en uno solo
+dt_combinado <- rbindlist(lista_predicciones)
+
+
+# Calcula el promedio de la columna 'prob' agrupado por 'numero_de_cliente'
+tb_pred_fin <- dt_combinado[, 
+                           list(prob_promediada = mean(prob, na.rm = TRUE)), 
+                           by = numero_de_cliente]
+
+# Renombra la columna promediada a "prob" como se requiere
+setnames(tb_pred_fin, "prob_promediada", "prob")
+
+tb_pred_fin[, foto_mes := PARAM$future]
+
+# 3. Ordenar y Guardar el Resultado
+# ===
+
+# Ordenar el resultado de forma descendente por la columna "prob"
+setorder(tb_pred_fin, -prob)
+
+# Guardar localmente el archivo CSV
+nombre_archivo_salida <- "prediccion_final_ensamble.csv"
+
+fwrite(tb_pred_fin, 
+       file = nombre_archivo_salida, 
+       sep = ",",
+       dec = ".", # Asegura que el separador decimal sea el punto
+       row.names = FALSE)
+
+cat("\nProceso finalizado.\n")
+cat("Archivo de ensamble guardado localmente como:", nombre_archivo_salida, "\n")
+cat("El resultado final está disponible en la variable 'tb_pred_fin'.\n")
+
+
+
+# dir.create(archivo_kaggle)
+
+#--------------- 
+# mejor Envio del punto anterior
+
+envios <- 13000
+
+  tb_pred_fin[, Predicted := 0L] # seteo inicial a 0
+  tb_pred_fin[1:envios, Predicted := 1L] # marco los primeros
+
+  archivo_kaggle <- paste0("KA", PARAM$experimento, "_", envios, ".csv")
+
+  # grabo el archivo
+  fwrite(tb_pred_fin[, list(numero_de_cliente, Predicted)],
+    file= archivo_kaggle,
+    sep= ","
+  )
+
+  res <- realidad_evaluar( drealidad, tb_pred_fin)
+
+  options(scipen = 999)
+  cat( "Envios=", envios, "\t",
+    " TOTAL=", res$total,
+    "  Public=", res$public,
+    " Private=", res$private,
+    "\n",
+    sep= ""
+  )
+
+
+```
+
+
+
+```{r auc_test, eval=FALSE}
+dataset_test <- dataset[foto_mes %in% PARAM$future_env]
+
+# paso la clase a binaria que tome valores {0,1}  enteros
+#  BAJA+2  son  1, BAJA+1 y CONTINUA es 0
+#  a partir de ahora ya NO puedo cortar  por prob(BAJA+2) > 1/40
+
+dataset_test[,
+  clase01 := ifelse(clase_ternaria %in% c("BAJA+2", "BAJA+1"), 1L, 0L)
+]
+
+for (i in seq_along(semillas_prim)) {
+
+# a. Obtener la semilla actual
+semilla_actual <- semillas_prim[i]
+
+# b. Insertar la semilla actual en los parámetros (ASUMIENDO QUE EXISTE LA CLAVE 'seed')
+param_normalizado$seed <- semilla_actual  
+  
+PARAM$semilla_primigenia <- semilla_actual
+
+# defino los datos que forma parte del training
+#
+# notar que para esto utilizo la SEGUNDA semilla
+
+set.seed(PARAM$semilla_primigenia, kind = "L'Ecuyer-CMRG")
+dataset_test[, azar := runif(nrow(dataset_test))]
+dataset_test[, training := 0L]
+
+dataset_test[
+  foto_mes %in%  PARAM$future_env &
+    (azar <= 1 | clase_ternaria %in% c("BAJA+1","BAJA+2")),
+  training := 1L
+]
+
+# los campos que se van a utilizar
+
+campos_buenos <- setdiff(
+  colnames(dataset_test),
+  c("clase_ternaria", "clase01", "azar", "training")
+)
+
+# dejo los datos en el formato que necesita LightGBM
+
+dtest <- lgb.Dataset(
+  data= data.matrix(dataset_test[training == 1L, campos_buenos, with= FALSE]),
+  label= dataset_test[training == 1L, clase01],
+  free_raw_data= FALSE
+)
+
+nrow(dtest)
+ncol(dtest)
+
+
+# Defino función de Testo
+# En el argumento x llegan los parmaetros de la bayesiana
+#  devuelve la AUC en cross validation del modelo entrenado
+
+Estimar_TEST_Gan_AUC_lightgbm <- function(x) {
+
+  # x pisa (o agrega) a param_fijos
+  param_completo <- modifyList(PARAM$lgbm$param_fijos, x)
+
+  # entreno LightGBM
+  modelocv <- lgb.cv(
+    data= dtrain,
+    nfold= PARAM$hyperparametertuning$xval_folds,
+    stratified= TRUE,
+    param= param_completo
+  )
+
+  # obtengo la ganancia
+  AUC <- modelocv$best_score
+
+  # hago espacio en la memoria
+  rm(modelocv)
+  gc(full= TRUE, verbose= FALSE)
+
+  message(format(Sys.time(), "%a %b %d %X %Y"), "-", semilla_actual, " AUC ", AUC)
+
+  return(AUC)
+}
+
+Estimar_TEST_Gan_AUC_lightgbm(PARAM$lgbm$param_fijos)
+
+}
+```
+
+
+
+# ENVIOS
+
+```{r envio, eval=FALSE}
+# 
+# # 1. Definir la lista de semillas (5 números cualesquiera)
+semillas_prim <- c(378553, 900007, 749987, 499987, 254881, 100057, 100207, 100237, 100267, 100297)
+# 
+# # 2. Inicializar una lista para guardar todos los modelos (opcional, pero recomendado)
+# modelos_finales <- list()
+# 
+# # 3. Iterar sobre las semillas
+for (i in seq_along(semillas_prim)) {
+# genero archivos con los  "envios" mejores
+# suba TODOS los archivos a Kaggle
+# a. Obtener la semilla actual
+semilla_actual <- semillas_prim[i]
+# ordeno por probabilidad descendente
+setorder(tb_prediccion, -prob)
+
+dir.create("kaggle")
+
+# b. Insertar la semilla actual en los parámetros
+  param_normalizado$seed <- semilla_actual
+
+# aplico el modelo a los datos sin clase
+dfuture_env <- dataset[foto_mes %in% PARAM$future_env]
+
+
+# modelo TEST
+modelo_test <- lgb.train(
+  data = dtrain,
+  param = param_normalizado
+)
+
+# aplico el modelo a los datos nuevos
+prediccion <- predict(
+  modelo_test,
+  data.matrix(dfuture_env[, campos_buenos, with= FALSE])
+)
+
+# inicilizo el dataset  drealidad
+drealidad_env <- realidad_inicializar( dfuture_env, param_normalizado)
+
+# tabla de prediccion
+
+tb_prediccion_env <- dfuture_env[, list(numero_de_cliente, foto_mes)]
+tb_prediccion_env[, prob := prediccion ]
+
+# ordeno por probabilidad descendente
+setorder(tb_prediccion_env, -prob)
+
+for (envios in PARAM$cortes) {
+
+  tb_prediccion_env[, Predicted := 0L] # seteo inicial a 0
+  tb_prediccion_env[1:envios, Predicted := 1L] # marco los primeros
+
+  archivo_kaggle <- paste0("./kaggle/KA", PARAM$experimento, "_", semilla_actual, "_", envios, ".csv")
+
+  # grabo el archivo
+  fwrite(tb_prediccion_env[, list(numero_de_cliente, Predicted)],
+    file= archivo_kaggle,
+    sep= ","
+  )
+
+  res <- realidad_evaluar( drealidad_env, tb_prediccion_env)
+
+  options(scipen = 999)
+  cat( "Envios=", envios, "\t",
+    " TOTAL=", res$total,
+    "  Public=", res$public,
+    " Private=", res$private,
+    "\n",
+    sep= ""
+  )
+
+}
+}
+write_yaml( PARAM, file="PARAM.yml")
+
+cat("Entrenamiento completado para semilla:", semilla_actual, "\n")
+
+
+# La variable 'modelos_finales' ahora contiene los 5 modelos entrenados.
+```
+```
