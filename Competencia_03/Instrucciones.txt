@@ -1,0 +1,6 @@
+1. Correr los notebooks: 
+	e3-ksem-ipccorr
+	e3t1-6-ff-4-c2-fin
+	e3t1-6-ff-4-ipccorr-fin
+para generar los tres archivos de predicciones
+2. Correr el notebook: ENSAMBLE para generar el archivo de submit

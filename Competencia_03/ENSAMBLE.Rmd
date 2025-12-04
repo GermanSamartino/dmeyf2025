@@ -1,0 +1,178 @@
+---
+title: "TP2-Entrega"
+author: "Germán Samartino Salerno"
+date: "02/10/2025"
+output:
+   html_document:
+     toc: yes
+     code_folding: show
+     toc_float: yes
+     df_print: paged
+     theme: united
+     code_download: true
+---
+# START
+```{r librerias, include=FALSE, eval=FALSE}
+# limpio la memoria
+rm(list=ls(all.names=TRUE)) # remove all objects
+gc(full=TRUE, verbose=FALSE) # garbage collection
+
+# cargo las librerias que necesito
+require("data.table")
+require("parallel")
+
+if(!require("R.utils")) install.packages("R.utils")
+require("R.utils")
+
+if( !require("primes") ) install.packages("primes")
+require("primes")
+
+if( !require("utils") ) install.packages("utils")
+require("utils")
+
+if( !require("rlist") ) install.packages("rlist")
+require("rlist")
+
+if( !require("yaml")) install.packages("yaml")
+require("yaml")
+# 
+# if( !require("lightgbm") ) install.packages("lightgbm")
+# require("lightgbm")
+
+if( !require("DiceKriging") ) install.packages("DiceKriging")
+require("DiceKriging")
+
+if( !require("mlrMBO") ) install.packages("mlrMBO")
+require("mlrMBO")
+
+# if( !require("zlightgbm") ) install.packages("https://storage.googleapis.com/open-courses/dmeyf2025-e4a2/zlightgbm_4.6.0.99.tar.gz", repos= NULL, type= "source")
+# require("zlightgbm")
+# 
+# if( !require("zlightgbm") ) install.packages("https://storage.googleapis.com/open-courses/dmeyf2025-e4a2/cutoff/zlightgbm_4.6.0.99.tar.gz", repos= NULL, type= "source")
+# require("zlightgbm")
+
+
+library(data.table)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+
+
+t_inicio <- proc.time()
+Sys.time()
+```
+
+
+
+```{r read_data}
+# Lista de archivos de predicción a leer
+ARCHIVOS_PREDICCION <- c(
+  "prediccion1.txt", 
+  "prediccion2.txt", 
+  "prediccion3.txt"
+)
+
+NOMBRE_ARCHIVO_SALIDA <- "predicciones_ensamble.csv"
+CLAVE_AGRUPACION <- "numero_de_cliente"
+COLUMNA_PREDICCION <- "prob"
+
+
+# ==============================================================================
+# 2. CARGA Y COMBINACIÓN DE DATOS
+# ==============================================================================
+
+cat("⏳ Iniciando carga y combinación de archivos...\n")
+
+# Lista temporal para almacenar los data.tables
+lista_dt <- list()
+
+for (archivo in ARCHIVOS_PREDICCION) {
+  if (file.exists(archivo)) {
+    # Usamos fread para leer solo las columnas necesarias (eficiente)
+    dt_temp <- fread(archivo, select = c(CLAVE_AGRUPACION, COLUMNA_PREDICCION))
+    lista_dt[[archivo]] <- dt_temp
+    cat(paste0("   - Leído archivo: ", archivo, "\n"))
+  } else {
+    cat(paste0("   - ADVERTENCIA: Archivo no encontrado: ", archivo, ". Saltando...\n"))
+  }
+}
+
+# Combina todos los data.tables en uno solo (apilando filas)
+dt_combinado <- rbindlist(lista_dt, fill = TRUE)
+
+cat("✅ Combinación de datos completada.\n")
+
+
+# ==============================================================================
+# 3. SUMA Y AGRUPACIÓN DE PREDICCIONES
+# ==============================================================================
+
+cat("⏳ Calculando la suma de probabilidades por cliente...\n")
+
+# Agrupar por numero_de_cliente y sumar la columna 'prob'
+tb_predicciones_finales <- dt_combinado[, 
+  list(prob_sumada = sum(get(COLUMNA_PREDICCION), na.rm = TRUE)), 
+  by = get(CLAVE_AGRUPACION)
+]
+
+# Renombrar la columna de clave a su nombre original
+# Se añade skip_absent=TRUE para manejar el caso donde el nombre ya es CLAVE_AGRUPACION
+setnames(tb_predicciones_finales, "V1", CLAVE_AGRUPACION, skip_absent = TRUE)
+
+
+# ==============================================================================
+# 4. ORDENAMIENTO Y EXPORTACIÓN
+# ==============================================================================
+
+# Ordenar el resultado por la nueva columna 'prob_sumada' de forma descendente (-)
+setorder(tb_predicciones_finales, -prob_sumada)
+
+cat("✅ Ordenamiento completado. Guardando archivo final...\n")
+
+# Exportar a CSV localmente
+fwrite(
+  tb_predicciones_finales, 
+  file = NOMBRE_ARCHIVO_SALIDA, 
+  sep = ",",
+  row.names = FALSE
+)
+
+cat(paste0("🎉 Éxito: Archivo de ensamble guardado en: ", NOMBRE_ARCHIVO_SALIDA, "\n"))
+
+```
+
+
+
+```{r archivo}
+# genero archivos con los  "envios" mejores
+dir.create("kaggle", showWarnings=FALSE)
+
+tb_prediccion <- fread("predicciones_ensamble.csv")
+
+# genero archivos de fantasia, que NO son el que voy a subir a la Pseudo Competencia Kaggle
+envios <- 11000
+
+for( vapo in seq(PARAM$train_final$APO) ) {
+  if( tb_prediccion[meta_modelo==vapo, .N] > 0 ) {
+    tb_pred <- tb_prediccion[meta_modelo==vapo]
+    setorder( tb_pred, -prob )
+    tb_pred[, Predicted := 0L] # seteo inicial a 0
+    tb_pred[1:envios, Predicted := 1L] # marco los primeros
+
+    archivo_kaggle <- paste0("./kaggle/KA", PARAM$experimento, "_", vapo, "_", envios, ".csv")
+
+    # grabo el archivo
+    fwrite(tb_pred[, list(numero_de_cliente, Predicted)],
+      file= archivo_kaggle,
+      sep= ","
+    )
+
+    rm( tb_pred )
+    gc()
+  }
+}
+
+Sys.time()
+
+
+```
